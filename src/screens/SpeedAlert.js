@@ -1,23 +1,25 @@
 import React, { useEffect } from 'react';
-import { View, Text, Alert, Image, StyleSheet } from 'react-native';
+import { View, Text, Alert,  StyleSheet } from 'react-native';
 import Sound from 'react-native-sound';
 
-// Set category so it plays even in silent mode (iOS-safe)
+// Set category for audio playback
 Sound.setCategory('Playback');
 
 const SpeedAlert = () => {
   useEffect(() => {
     const alertSound = new Sound('alert.mp3', Sound.MAIN_BUNDLE, (error) => {
       if (error) {
-        console.log('Failed to load the sound', error);
-        Alert.alert('Error', 'Could not load the alert sound.');
+        console.log('  Failed to load sound:', error);
+        Alert.alert('Error', 'Could not load alert sound.');
         return;
       }
 
       alertSound.play((success) => {
         if (!success) {
-          console.log('Playback failed');
+          console.log('  Playback failed');
           Alert.alert('Error', 'Alert sound playback failed.');
+        } else {
+          console.log(' Sound played successfully');
         }
       });
     });
@@ -29,9 +31,8 @@ const SpeedAlert = () => {
 
   return (
     <View style={styles.container}>
-      <Image source={require('../../assets/speed-alert.png')}
-      style={styles.Image}/>
-      <Text style={styles.title}>Speed Alert Activated </Text>
+
+      <Text style={styles.title}>Speed Alert Activated</Text>
     </View>
   );
 };
@@ -39,21 +40,20 @@ const SpeedAlert = () => {
 const styles = StyleSheet.create({
   container: {
     flex: 1,
+    backgroundColor: '#fff',
     justifyContent: 'center',
     alignItems: 'center',
-    backgroundColor: '#fff',
+  },
+  image: {
+    width: 75,
+    height: 70,
+    marginBottom: 20,
   },
   title: {
     fontSize: 24,
     fontWeight: 'bold',
-    image: {
-      width: 75,
-      height: 70,
-    },
+    color: '#e53935',
   },
 });
 
 export default SpeedAlert;
-
-
-

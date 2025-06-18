@@ -80,6 +80,7 @@ android {
 
     namespace "com.goslowapp"
     defaultConfig {
+        manifestPlaceholders = [usescleartextTraffic: "true"]
         applicationId "com.goslowapp"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion

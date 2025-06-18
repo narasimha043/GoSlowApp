@@ -1,172 +1,330 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { View, StyleSheet, PermissionsAndroid, Text } from 'react-native';
+import {
+  View,
+  StyleSheet,
+  PermissionsAndroid,
+  Text,
+  Platform,
+  Vibration,
+  Pressable,
+  TextInput,
+  Modal,
+} from 'react-native';
 import MapView, { Marker } from 'react-native-maps';
-import { GooglePlacesAutocomplete } from 'react-native-google-places-autocomplete';
-import MapViewDirections from 'react-native-maps-directions';
 import Geolocation from '@react-native-community/geolocation';
 import { useNavigation } from '@react-navigation/native';
+import dgram from 'react-native-udp';
+import geolib from 'geolib';
+import Sound from 'react-native-sound';
+import DeviceInfo from 'react-native-device-info';
 
-const GOOGLE_API_KEY = 'AIzaSyDgeazKbpGJ-GQIDolhkfgDk2XfTbrBKcs';
+const UDP_PORT = 41234;
+const SPEED_LIMIT_ALERT = 30;
+const SPEED_LIMIT_WARNING = 5;
+const DISTANCE_LIMIT = 25;
+
+Sound.setCategory('Playback');
 
 const HomeScreen = () => {
   const mapRef = useRef(null);
   const navigation = useNavigation();
   const [origin, setOrigin] = useState(null);
-  const [destination, setDestination] = useState(null);
   const [speed, setSpeed] = useState(0);
+  const [nearbyAlert, setNearbyAlert] = useState(false);
+  const [tracking, setTracking] = useState(false);
+  const [targetIp, setTargetIp] = useState('');
+  const [modalVisible, setModalVisible] = useState(true);
+
+  const socketRef = useRef(null);
+  const deviceIdRef = useRef('');
+  const lastAlertTimeRef = useRef(0);
+  const currentLocationRef = useRef(null);
+  const alertSoundRef = useRef(null);
+  const watchIdRef = useRef(null);
 
   useEffect(() => {
-    const requestLocationPermission = async () => {
-      try {
-        const granted = await PermissionsAndroid.request(
-          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
-        );
-        if (granted === PermissionsAndroid.RESULTS.GRANTED) {
-          Geolocation.watchPosition(
-            position => {
-              const { coords } = position;
-              const currentSpeed = Math.round(coords.speed * 3.6); // m/s to km/h
-              setSpeed(currentSpeed);
+    deviceIdRef.current = DeviceInfo.getUniqueId();
+    alertSoundRef.current = new Sound('alert.mp3', Sound.MAIN_BUNDLE, (error) => {
+      if (error) {
+        console.log('Sound load error:', error);
+        alertSoundRef.current = null;
+      } else {
+        console.log('Sound loaded');
+      }
+    });
 
-              if (currentSpeed > 10) {
-                navigation.navigate('SpeedAlert');
-              }
-
-              if (!origin) {
-                setOrigin({
-                  latitude: coords.latitude,
-                  longitude: coords.longitude,
-                });
-              }
-            },
-            error => console.log(error),
-            {
-              enableHighAccuracy: true,
-              distanceFilter: 1,
-              interval: 1000,
-              fastestInterval: 500,
-            },
-          );
-        }
-      } catch (err) {
-        console.warn(err);
+    return () => {
+      if (alertSoundRef.current) {
+        alertSoundRef.current.release();
       }
     };
+  }, []);
 
-    requestLocationPermission();
-  }, [navigation, origin]);
+  const playAlert = () => {
+    Vibration.vibrate([500, 500, 500]);
+    if (alertSoundRef.current) {
+      alertSoundRef.current.stop(() => {
+        alertSoundRef.current.play((success) => {
+          if (!success) {
+            console.log('Playback failed');
+          } else {
+            console.log('Alert sound played');
+          }
+        });
+      });
+    }
+  };
+
+  const startTracking = async () => {
+    if (!targetIp) {
+      console.warn('Target IP is empty');
+      return;
+    }
+
+    if (Platform.OS === 'android') {
+      const granted = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
+      );
+      if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+        console.log('Location permission denied');
+        return;
+      }
+    }
+
+    const socket = dgram.createSocket('udp4');
+    socketRef.current = socket;
+
+    socket.bind(UDP_PORT, undefined, () => {
+      socket.setBroadcast(false);
+      console.log('UDP socket bound');
+    });
+
+    socket.on('message', (msg) => {
+      try {
+        const data = JSON.parse(msg.toString());
+        if (data.deviceId === deviceIdRef.current) {return;}
+
+        if (currentLocationRef.current) {
+          const distance = geolib.getDistance(currentLocationRef.current, {
+            latitude: data.latitude,
+            longitude: data.longitude,
+          });
+
+          console.log(`📡 Received: Speed=${data.speed}, Distance=${distance}m`);
+
+          if (
+            distance < DISTANCE_LIMIT &&
+            (data.speed > SPEED_LIMIT_WARNING || speed > SPEED_LIMIT_WARNING)
+          ) {
+            const now = Date.now();
+            if (now - lastAlertTimeRef.current > 10000) {
+              lastAlertTimeRef.current = now;
+              playAlert();
+              setNearbyAlert(true);
+              setTimeout(() => setNearbyAlert(false), 3000);
+            }
+          }
+        }
+      } catch (e) {
+        console.log('UDP parse error:', e);
+      }
+    });
+
+    watchIdRef.current = Geolocation.watchPosition(
+      (position) => {
+        const { coords } = position;
+        const currentSpeed = Math.round((coords.speed || 0) * 3.6);
+        setSpeed(currentSpeed);
+
+        const location = {
+          latitude: coords.latitude,
+          longitude: coords.longitude,
+        };
+        currentLocationRef.current = location;
+
+        if (!origin) {
+          setOrigin(location);
+        }
+
+        const message = JSON.stringify({
+          deviceId: deviceIdRef.current,
+          latitude: coords.latitude,
+          longitude: coords.longitude,
+          speed: currentSpeed,
+        });
+
+        socket.send(message, 0, message.length, UDP_PORT, targetIp, (err) => {
+          if (err) {console.log('UDP send error:', err);}
+        });
+
+        if (currentSpeed > SPEED_LIMIT_ALERT) {
+          navigation.navigate('SpeedAlert', { speed: currentSpeed });
+        }
+      },
+      (err) => console.log('Location error:', err),
+      {
+        enableHighAccuracy: true,
+        distanceFilter: 1,
+        interval: 1000,
+        fastestInterval: 500,
+      }
+    );
+  };
+
+  const stopTracking = () => {
+    setSpeed(0);
+    currentLocationRef.current = null;
+    if (watchIdRef.current !== null) {
+      Geolocation.clearWatch(watchIdRef.current);
+    }
+    if (socketRef.current) {
+      socketRef.current.close();
+      socketRef.current = null;
+    }
+  };
+
+  const toggleTracking = (enable) => {
+    setTracking(enable);
+    if (enable) {
+      startTracking();
+    } else {
+      stopTracking();
+    }
+  };
 
   return (
     <View style={styles.container}>
       <MapView
         ref={mapRef}
         style={StyleSheet.absoluteFill}
-        showsUserLocation
+        showsUserLocation={tracking}
+        followsUserLocation={tracking}
         initialRegion={{
           latitude: 28.6139,
-          longitude: 77.2090,
-          latitudeDelta: 0.05,
-          longitudeDelta: 0.05,
+          longitude: 77.209,
+          latitudeDelta: 0.01,
+          longitudeDelta: 0.01,
         }}
       >
-        {origin && <Marker coordinate={origin} title="Origin" />}
-        {destination && <Marker coordinate={destination} title="Destination" />}
-
-        {origin && destination && (
-          <MapViewDirections
-            origin={origin}
-            destination={destination}
-            apikey={GOOGLE_API_KEY}
-            strokeWidth={4}
-            strokeColor="blue"
-            onReady={result => {
-              mapRef.current.fitToCoordinates(result.coordinates, {
-                edgePadding: { top: 50, bottom: 50, left: 50, right: 50 },
-              });
-            }}
-          />
-        )}
+        {origin && <Marker coordinate={origin} title="You" />}
       </MapView>
 
-      <View style={styles.searchContainer}>
-        <GooglePlacesAutocomplete
-          placeholder="From..."
-          onPress={(data, details = null) => {
-            const loc = details.geometry.location;
-            setOrigin({ latitude: loc.lat, longitude: loc.lng });
-          }}
-          fetchDetails
-          query={{ key: GOOGLE_API_KEY, language: 'en' }}
-          styles={autoCompleteStyles}
-          enablePoweredByContainer={false}
-          textInputProps={{
-            placeholderTextColor: '#000',
-          }}
-          predefinedPlaces={[]}
-        />
-
-        <GooglePlacesAutocomplete
-          placeholder="To..."
-          onPress={(data, details = null) => {
-            const loc = details.geometry.location;
-            setDestination({ latitude: loc.lat, longitude: loc.lng });
-          }}
-          fetchDetails
-          query={{ key: GOOGLE_API_KEY, language: 'en' }}
-          styles={autoCompleteStyles}
-          enablePoweredByContainer={false}
-          textInputProps={{
-            placeholderTextColor: '#000',
-          }}
-          predefinedPlaces={[]}
-        />
+      <View style={styles.controls}>
+        <Text style={styles.statusText}>Tracking is {tracking ? 'ON' : 'OFF'}</Text>
+        <View style={styles.buttonRow}>
+          <Pressable
+            style={[styles.button, tracking ? styles.buttonSelected : styles.buttonInactive]}
+            onPress={() => toggleTracking(true)}
+          >
+            <Text style={styles.buttonText}>ON</Text>
+          </Pressable>
+          <Pressable
+            style={[styles.button, !tracking ? styles.buttonSelectedOff : styles.buttonInactive]}
+            onPress={() => toggleTracking(false)}
+          >
+            <Text style={styles.buttonText}>OFF</Text>
+          </Pressable>
+        </View>
       </View>
 
-      <View style={styles.speedContainer}>
+      <View style={styles.speedBox}>
         <Text style={styles.speedText}>{speed} km/h</Text>
       </View>
+
+      {nearbyAlert && (
+        <View style={styles.alertBox}>
+          <Text style={styles.alertText}>NEARBY DANGER ALERT!</Text>
+        </View>
+      )}
+
+      <Modal visible={modalVisible} transparent animationType="slide">
+        <View style={styles.modalContainer}>
+          <View style={styles.modalContent}>
+            <Text style={styles.modalTitle}>Enter Target IP</Text>
+            <TextInput
+              placeholder="e.g. 192.168.55.123"
+              value={targetIp}
+              onChangeText={setTargetIp}
+              keyboardType="numeric"
+              style={styles.input}
+            />
+            <Pressable
+              style={styles.modalButton}
+              onPress={() => setModalVisible(false)}
+              disabled={!targetIp}
+            >
+              <Text style={styles.modalButtonText}>Start</Text>
+            </Pressable>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 };
 
-export default HomeScreen;
-
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-  },
-  searchContainer: {
+  container: { flex: 1 },
+  controls: {
     position: 'absolute',
     top: 40,
-    width: '90%',
-    alignSelf: 'center',
-    zIndex: 999,
+    width: '100%',
+    alignItems: 'center',
   },
-  speedContainer: {
+  statusText: { fontSize: 18, fontWeight: 'bold', marginBottom: 10, color: '#000' },
+  buttonRow: { flexDirection: 'row', gap: 10 },
+  button: { paddingVertical: 10, paddingHorizontal: 25, borderRadius: 10, elevation: 3 },
+  buttonSelected: { backgroundColor: 'green' },
+  buttonSelectedOff: { backgroundColor: 'red' },
+  buttonInactive: { backgroundColor: '#aaa' },
+  buttonText: { color: 'white', fontSize: 16, fontWeight: 'bold' },
+  speedBox: {
     position: 'absolute',
-    bottom: 60,
+    bottom: 40,
     left: 20,
-    backgroundColor: 'rgba(0,0,0,0.6)',
+    backgroundColor: 'black',
     padding: 10,
     borderRadius: 10,
   },
-  speedText: {
-    color: '#fff',
-    fontSize: 18,
+  speedText: { color: 'white', fontSize: 18, fontWeight: 'bold' },
+  alertBox: {
+    position: 'absolute',
+    top: '35%',
+    alignSelf: 'center',
+    backgroundColor: 'rgba(255, 0, 0, 0.9)',
+    padding: 20,
+    borderRadius: 12,
   },
-});
-
-const autoCompleteStyles = {
-  container: {
-    flex: 0,
-    marginBottom: 10,
+  alertText: { color: 'white', fontSize: 20, fontWeight: 'bold' },
+  modalContainer: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    justifyContent: 'center',
+    alignItems: 'center',
   },
-  textInput: {
-    height: 44,
+  modalContent: {
+    backgroundColor: 'white',
+    padding: 25,
+    borderRadius: 15,
+    width: '85%',
+    alignItems: 'center',
+  },
+  modalTitle: { fontSize: 18, fontWeight: 'bold', marginBottom: 10 },
+  input: {
+    borderColor: '#888',
+    borderWidth: 1,
+    width: '100%',
     borderRadius: 8,
     paddingHorizontal: 10,
-    backgroundColor: '#fff',
-    fontSize: 16,
+    paddingVertical: 8,
+    marginBottom: 15,
   },
-};
+  modalButton: {
+    backgroundColor: 'blue',
+    paddingVertical: 10,
+    paddingHorizontal: 25,
+    borderRadius: 8,
+  },
+  modalButtonText: { color: 'white', fontWeight: 'bold', fontSize: 16 },
+});
 
+export default HomeScreen;
